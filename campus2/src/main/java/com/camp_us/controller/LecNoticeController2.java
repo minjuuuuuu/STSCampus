@@ -15,23 +15,21 @@ import javax.servlet.http.HttpSession;
 import org.apache.ibatis.session.SqlSession;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.MediaType;
-import org.springframework.web.bind.annotation.CookieValue;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
-import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
-
 import org.springframework.web.multipart.MultipartFile;
 
 import com.camp_us.command.PageMakerMJ;
 import com.camp_us.dto.LecNoticeVO;
 import com.camp_us.dto.MemberVO;
 import com.camp_us.service.LecNoticeService;
+import com.camp_us.service.MemberService;
 
 @RestController
 @RequestMapping("/api/lecnotice")
@@ -41,7 +39,10 @@ public class LecNoticeController2 {
 
     @Autowired
     private SqlSession sqlSession;
-
+    
+    @Autowired
+    private MemberService memberService;
+    
     @Autowired
     public LecNoticeController2(LecNoticeService lecNoticeService) {
         this.lecNoticeService = lecNoticeService;
@@ -129,6 +130,7 @@ public class LecNoticeController2 {
     // 등록 (JSON 전송용) : 파일 없이 텍스트만
     @PostMapping(path = "", consumes = MediaType.APPLICATION_JSON_VALUE)
     public Map<String, Object> createJson(
+    		@RequestParam String memId,
             @RequestBody LecNoticeVO body,
             HttpSession session) throws Exception {
 
@@ -139,10 +141,9 @@ public class LecNoticeController2 {
             body.setLecId(String.valueOf(sel));
         }
 
-        MemberVO loginUser = (MemberVO) session.getAttribute("loginUser");
+        MemberVO loginUser = memberService.getMemberById(memId);
         if (loginUser == null) return Map.of("ok", false, "reason", "로그인 필요");
 
-        String memId = loginUser.getMem_id();
         String profesId = sqlSession.selectOne("LecNoticeMapper.selectProfesIdByMemId", memId);
         if (profesId == null) return Map.of("ok", false, "reason", "교수 ID를 찾을 수 없습니다.");
 
@@ -161,10 +162,11 @@ public class LecNoticeController2 {
         return Map.of("ok", true, "lecNoticeId", body.getLecNoticeId());
     }
 
-    // 등록 (Multipart 전송용) : 파일 업로드 포함
+ // 등록 (Multipart 전송용) : 파일 업로드 포함
     @PostMapping(path = "", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
     public Map<String, Object> createMultipart(
-            @RequestParam(value = "lec_id", required = false) String lecId,
+            @RequestParam String memId,
+            @RequestParam(value = "lecId", required = false) String lecId,
             @RequestParam("lecNoticeName") String lecNoticeName,
             @RequestParam("lecNoticeDesc") String lecNoticeDesc,
             @RequestParam(value = "files", required = false) List<MultipartFile> files,
@@ -173,23 +175,28 @@ public class LecNoticeController2 {
 
         if (lecId == null || lecId.isBlank()) {
             Object sel = session.getAttribute("selectedLecId");
-            if (sel == null) return Map.of("ok", false, "reason", "lec_id is blank");
+            if (sel == null) return Map.of("ok", false, "reason", "lecId is blank");
             lecId = String.valueOf(sel);
         }
 
-        MemberVO loginUser = (MemberVO) session.getAttribute("loginUser");
+        // 1. memId → MemberVO 조회
+        MemberVO loginUser = memberService.getMemberById(memId);
         if (loginUser == null) return Map.of("ok", false, "reason", "로그인 필요");
 
-        String memId = loginUser.getMem_id();
+        // 2. memId → profesId 보정
         String profesId = sqlSession.selectOne("LecNoticeMapper.selectProfesIdByMemId", memId);
+        if (profesId == null) return Map.of("ok", false, "reason", "profesId not found");
+
+        // 3. 해당 교수(profesId)가 이 강의(lecId) 담당인지 확인
         Integer owns = sqlSession.selectOne("LecNoticeMapper.countProLecByIds",
                 Map.of("profesId", profesId, "lecId", lecId));
-        if (profesId == null || owns == null || owns == 0)
+        if (owns == null || owns == 0)
             return Map.of("ok", false, "reason", "담당 강의가 아닙니다.");
 
+        // 4. 새 ID 생성
         int nextId = lecNoticeService.getMaxLecNoticeId() + 1;
 
-        // 파일 저장
+        // 5. 파일 저장
         String uploadPath = request.getServletContext().getRealPath("/resources/upload/lecnotice");
         File dir = new File(uploadPath);
         if (!dir.exists()) dir.mkdirs();
@@ -202,16 +209,18 @@ public class LecNoticeController2 {
                 if (mf != null && !mf.isEmpty()) {
                     String saved = UUID.randomUUID() + "_" + mf.getOriginalFilename();
                     mf.transferTo(new File(dir, saved));
-                    if (idx == 0) fileName = saved; else if (idx == 1) fileDetail = saved;
+                    if (idx == 0) fileName = saved;
+                    else if (idx == 1) fileDetail = saved;
                     if (++idx >= 2) break;
                 }
             }
         }
 
+        // 6. LecNoticeVO 세팅
         LecNoticeVO vo = new LecNoticeVO();
         vo.setLecNoticeId(String.valueOf(nextId));
         vo.setLecId(lecId);
-        vo.setProfesId(profesId);
+        vo.setProfesId(profesId); // ✅ 보정된 profesId 저장
         vo.setLecNoticeName(lecNoticeName);
         vo.setLecNoticeDesc(lecNoticeDesc);
         vo.setLecNoticeDate(new Timestamp(System.currentTimeMillis()));
@@ -219,35 +228,25 @@ public class LecNoticeController2 {
         vo.setFileDetail(fileDetail);
 
         lecNoticeService.registLecNotice(vo);
-        return Map.of("ok", true, "lecNoticeId", vo.getLecNoticeId(), "fileName", fileName, "fileDetail", fileDetail);
+
+        return Map.of("ok", true, "lecNoticeId", vo.getLecNoticeId(),
+                "fileName", fileName, "fileDetail", fileDetail);
     }
 
-    // 수정 (JSON, 파일 없이)
-    @PutMapping(path = "/{id}", consumes = MediaType.APPLICATION_JSON_VALUE)
-    public Map<String, Object> updateJson(@PathVariable("id") String id, @RequestBody LecNoticeVO body) throws Exception {
-        LecNoticeVO origin = lecNoticeService.getLecNoticeById(id);
-        if (origin == null) return Map.of("ok", false, "reason", "not found");
 
-        origin.setLecNoticeName(body.getLecNoticeName());
-        origin.setLecNoticeDesc(body.getLecNoticeDesc());
-        // 파일 값이 비어오면 유지, 명시적으로 none.pdf를 주면 제거
-        if (body.getFileName() != null)  origin.setFileName(body.getFileName());
-        if (body.getFileDetail() != null) origin.setFileDetail(body.getFileDetail());
 
-        lecNoticeService.modifyLecNotice(origin);
-        return Map.of("ok", true);
-    }
-
-    // 수정 (Multipart, 파일 교체/제거)
-    @PutMapping(path = "/{id}", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
-    public Map<String, Object> updateMultipart(
-            @PathVariable("id") String id,
-            @RequestParam("lecNoticeName") String lecNoticeName,
-            @RequestParam("lecNoticeDesc") String lecNoticeDesc,
-            @RequestParam(value = "removeFile1", required = false) String remove1,
-            @RequestParam(value = "removeFile2", required = false) String remove2,
-            @RequestParam(value = "files", required = false) List<MultipartFile> files,
-            HttpServletRequest request) throws Exception {
+    @PostMapping(
+    	    path = "/{id}/update",
+    	    produces = "application/json; charset=UTF-8"   // 응답 타입 JSON 명시
+    	)
+    	public Map<String, Object> updateMultipart(
+    	        @PathVariable("id") String id,
+    	        @RequestParam("lecNoticeName") String lecNoticeName,
+    	        @RequestParam("lecNoticeDesc") String lecNoticeDesc,
+    	        @RequestParam(value = "removeFile1", required = false) String remove1,
+    	        @RequestParam(value = "removeFile2", required = false) String remove2,
+    	        @RequestParam(value = "files", required = false) List<MultipartFile> files,
+    	        HttpServletRequest request) throws Exception {
 
         LecNoticeVO origin = lecNoticeService.getLecNoticeById(id);
         if (origin == null) return Map.of("ok", false, "reason", "not found");
